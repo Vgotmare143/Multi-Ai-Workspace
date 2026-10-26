@@ -1,0 +1,22 @@
+{
+  "name": "multi-ai-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first Multi-AI Development Workspace with seamless provider and account handoff",
+  "workspaces": [
+    "packages/*",
+    "frontend"
+  ],
+  "scripts": {
+    "dev:frontend": "npm --workspace=frontend run dev",
+    "build:frontend": "npm --workspace=frontend run build",
+    "test:frontend": "npm --workspace=frontend run test",
+    "typecheck": "npm --workspace=frontend run typecheck"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5"
+  }
+}
