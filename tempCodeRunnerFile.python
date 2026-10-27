@@ -1,0 +1,458 @@
+import os
+import sys
+import zipfile
+from pathlib import Path
+
+# Default destination path (can be overridden via CLI argument)
+DEFAULT_ZIP_DEST = Path.home() / "Downloads" / "phase10_claude_account_vault.zip"
+
+FILES = {
+    "backend/app/core/vault.py": '''import base64
+import hashlib
+from typing import Optional
+from cryptography.fernet import Fernet, InvalidToken
+from app.config import settings
+
+
+class CredentialVault:
+    """
+    Encrypts and decrypts provider API credentials at rest.
+    Never exposes plaintext keys to logs, disk artifacts, or API responses.
+    """
+
+    def __init__(self, master_key: Optional[str] = None) -> None:
+        raw_key = (master_key or getattr(settings, "VAULT_MASTER_KEY", "")).strip()
+        self._fernet = self._build_fernet(raw_key)
+
+    @staticmethod
+    def _build_fernet(raw_key: str) -> Fernet:
+        # Derive a deterministic 32-byte URL-safe base64 key if a raw passphrase is provided
+        try:
+            if len(raw_key) == 44 and raw_key.endswith("="):
+                return Fernet(raw_key.encode("utf-8"))
+        except Exception:
+            pass
+        digest = hashlib.sha256(raw_key.encode("utf-8")).digest()
+        derived_key = base64.urlsafe_b64encode(digest)
+        return Fernet(derived_key)
+
+    def encrypt(self, plaintext_secret: str) -> bytes:
+        if not plaintext_secret:
+            return b""
+        return self._fernet.encrypt(plaintext_secret.encode("utf-8"))
+
+    def decrypt(self, encrypted_payload: bytes) -> Optional[str]:
+        if not encrypted_payload:
+            return None
+        try:
+            return self._fernet.decrypt(encrypted_payload).decode("utf-8")
+        except InvalidToken as exc:
+            raise ValueError("Failed to decrypt account credentials: invalid master key or corrupted ciphertext") from exc
+
+    @staticmethod
+    def fingerprint(plaintext_secret: Optional[str]) -> str:
+        """Returns a safe, non-reversible preview (e.g., 'sk-a...9f2a' or 'mock-mode')."""
+        if not plaintext_secret:
+            return "no-key-configured"
+        cleaned = plaintext_secret.strip()
+        if len(cleaned) <= 8:
+            return "***"
+        digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:6]
+        return f"{cleaned[:4]}...{cleaned[-4:]} (sha256:{digest})"
+
+
+vault = CredentialVault()
+''',
+
+    "backend/app/services/account_service.py": '''from datetime import datetime, timezone
+from typing import Dict, List, Literal, Optional
+from uuid import uuid4
+from pydantic import BaseModel, Field
+
+from app.core.vault import vault
+from app.providers.models import CanonicalChatRequest, CanonicalStreamEvent
+from app.providers.claude_provider import ClaudeProvider
+from app.providers.mock_provider import MockProvider
+
+ConnectionMode = Literal["mock", "web_bridge", "api_key", "local_ollama"]
+AccountQuotaStatus = Literal["Available", "Approaching Limit", "Limit Reached", "Unknown"]
+
+
+class AccountProfile(BaseModel):
+    id: str
+    provider_id: str = "claude"
+    account_label: str  # e.g., "Claude Account A", "Claude Account B"
+    connection_mode: ConnectionMode = "mock"
+    key_fingerprint: str = "no-key-configured"
+    priority_order: int = 1
+    quota_status: AccountQuotaStatus = "Available"
+    rate_limit_reset_at: Optional[str] = None
+    is_active: bool = False
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class AccountSwitchHandoffResult(BaseModel):
+    handoff_id: str
+    previous_account_id: str
+    previous_account_label: str
+    active_account_id: str
+    active_account_label: str
+    connection_mode: ConnectionMode
+    handoff_markdown_filename: str
+    switched_at: str
+    continuity_briefing: str
+
+
+class ClaudeAccountService:
+    """
+    Manages multiple isolated Claude accounts (Account A, Account B, Account C)
+    with encrypted in-vault API keys and zero credential leakage between accounts.
+    """
+
+    def __init__(self) -> None:
+        self._accounts: Dict[str, AccountProfile] = {}
+        self._encrypted_keys: Dict[str, bytes] = {}
+        self._active_account_id: Optional[str] = None
+        self._handoff_counter: int = 0
+        self._seed_default_claude_accounts()
+
+    def _seed_default_claude_accounts(self) -> None:
+        defaults = [
+            ("acct_claude_a", "Claude Account A", 1, True),
+            ("acct_claude_b", "Claude Account B", 2, False),
+            ("acct_claude_c", "Claude Account C", 3, False),
+        ]
+        for acct_id, label, priority, is_active in defaults:
+            self._accounts[acct_id] = AccountProfile(
+                id=acct_id,
+                provider_id="claude",
+                account_label=label,
+                connection_mode="mock",
+                key_fingerprint="mock-mode",
+                priority_order=priority,
+                quota_status="Available",
+                is_active=is_active,
+            )
+            self._encrypted_keys[acct_id] = b""
+            if is_active:
+                self._active_account_id = acct_id
+
+    def list_accounts(self, provider_id: str = "claude") -> List[AccountProfile]:
+        accounts = [a for a in self._accounts.values() if a.provider_id == provider_id]
+        return sorted(accounts, key=lambda a: a.priority_order)
+
+    def get_active_account(self) -> AccountProfile:
+        if not self._active_account_id or self._active_account_id not in self._accounts:
+            raise ValueError("No active Claude account configured")
+        return self._accounts[self._active_account_id]
+
+    def upsert_account(
+        self,
+        account_label: str,
+        connection_mode: ConnectionMode = "mock",
+        raw_api_key: Optional[str] = None,
+        priority_order: Optional[int] = None,
+        account_id: Optional[str] = None,
+    ) -> AccountProfile:
+        target_id = account_id
+        if not target_id:
+            for existing in self._accounts.values():
+                if existing.account_label.lower() == account_label.lower():
+                    target_id = existing.id
+                    break
+        if not target_id:
+            target_id = f"acct_{uuid4().hex[:10]}"
+
+        encrypted = vault.encrypt(raw_api_key) if raw_api_key else self._encrypted_keys.get(target_id, b"")
+        fingerprint = (
+            vault.fingerprint(raw_api_key)
+            if raw_api_key
+            else (
+                self._accounts[target_id].key_fingerprint
+                if target_id in self._accounts
+                else ("mock-mode" if connection_mode == "mock" else "no-key-configured")
+            )
+        )
+
+        order = priority_order if priority_order is not None else (len(self._accounts) + 1)
+        is_active = (target_id == self._active_account_id) or (self._active_account_id is None)
+
+        profile = AccountProfile(
+            id=target_id,
+            provider_id="claude",
+            account_label=account_label,
+            connection_mode=connection_mode,
+            key_fingerprint=fingerprint,
+            priority_order=order,
+            quota_status="Available",
+            is_active=is_active,
+        )
+        self._accounts[target_id] = profile
+        self._encrypted_keys[target_id] = encrypted
+
+        if is_active:
+            self._active_account_id = target_id
+
+        return profile
+
+    def get_decrypted_key_for_account(self, account_id: str) -> Optional[str]:
+        """Internal-only method used by the provider adapter right before an outbound request."""
+        if account_id not in self._accounts:
+            raise ValueError(f"Unknown account_id: {account_id}")
+        ciphertext = self._encrypted_keys.get(account_id, b"")
+        return vault.decrypt(ciphertext)
+
+    def mark_account_quota_status(
+        self,
+        account_id: str,
+        status: AccountQuotaStatus,
+        reset_at: Optional[str] = None,
+    ) -> AccountProfile:
+        if account_id not in self._accounts:
+            raise ValueError(f"Unknown account_id: {account_id}")
+        acct = self._accounts[account_id]
+        acct.quota_status = status
+        acct.rate_limit_reset_at = reset_at
+        acct.updated_at = datetime.now(timezone.utc).isoformat()
+        return acct
+
+    def switch_account(
+        self,
+        target_account_id: str,
+        current_task: str = "Active development task",
+        next_action: str = "Continue implementation from the previous account stopping point",
+    ) -> AccountSwitchHandoffResult:
+        if target_account_id not in self._accounts:
+            raise ValueError(f"Target Claude account '{target_account_id}' not found")
+
+        prev_account = self.get_active_account()
+        target_account = self._accounts[target_account_id]
+
+        # Flip active flags atomically
+        for acct in self._accounts.values():
+            acct.is_active = acct.id == target_account_id
+        self._active_account_id = target_account_id
+
+        self._handoff_counter += 1
+        handoff_filename = f"claude-session-{self._handoff_counter:03d}.md"
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        briefing = (
+            f"HANDOFF BRIEFING ({handoff_filename}): "
+            f"Switched from {prev_account.account_label} to {target_account.account_label}. "
+            f"Current Task: {current_task}. Next Action: {next_action}."
+        )
+
+        return AccountSwitchHandoffResult(
+            handoff_id=f"ho_{uuid4().hex[:12]}",
+            previous_account_id=prev_account.id,
+            previous_account_label=prev_account.account_label,
+            active_account_id=target_account.id,
+            active_account_label=target_account.account_label,
+            connection_mode=target_account.connection_mode,
+            handoff_markdown_filename=handoff_filename,
+            switched_at=now_iso,
+            continuity_briefing=briefing,
+        )
+
+    async def stream_with_active_account(
+        self,
+        request: CanonicalChatRequest,
+        claude_provider: Optional[ClaudeProvider] = None,
+        mock_provider: Optional[MockProvider] = None,
+    ):
+        """
+        Streams a chat request using ONLY the currently active Claude account's isolated credentials.
+        Falls back to MockProvider when the account is in 'mock' or 'web_bridge' mode.
+        """
+        active_acct = self.get_active_account()
+        decrypted_key = self.get_decrypted_key_for_account(active_acct.id)
+
+        if active_acct.connection_mode == "api_key" and decrypted_key:
+            provider = claude_provider or ClaudeProvider()
+            async for event in provider.stream_chat(request, api_key=decrypted_key):
+                yield event
+        else:
+            sim_provider = mock_provider or MockProvider()
+            async for event in sim_provider.stream_chat(request, api_key=None):
+                yield event
+
+
+account_service = ClaudeAccountService()
+''',
+
+    "backend/app/api/v1/accounts.py": '''from typing import List, Optional
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel
+
+from app.services.account_service import (
+    AccountProfile,
+    AccountSwitchHandoffResult,
+    ConnectionMode,
+    account_service,
+)
+
+router = APIRouter(prefix="/api/v1/accounts", tags=["Claude Accounts"])
+
+
+class UpsertAccountRequest(BaseModel):
+    account_id: Optional[str] = None
+    account_label: str
+    connection_mode: ConnectionMode = "mock"
+    api_key: Optional[str] = None
+    priority_order: Optional[int] = None
+
+
+class SwitchAccountRequest(BaseModel):
+    target_account_id: str
+    current_task: str = "Active development task"
+    next_action: str = "Continue from exact point where previous Claude account stopped"
+
+
+@router.get("/claude", response_model=List[AccountProfile])
+async def list_claude_accounts() -> List[AccountProfile]:
+    """Lists all configured Claude accounts (Account A, B, C) without exposing API keys."""
+    return account_service.list_accounts(provider_id="claude")
+
+
+@router.get("/claude/active", response_model=AccountProfile)
+async def get_active_claude_account() -> AccountProfile:
+    return account_service.get_active_account()
+
+
+@router.post("/claude", response_model=AccountProfile, status_code=status.HTTP_201_CREATED)
+async def upsert_claude_account(payload: UpsertAccountRequest) -> AccountProfile:
+    """Creates or updates a Claude account profile, encrypting any provided API key in the vault."""
+    return account_service.upsert_account(
+        account_id=payload.account_id,
+        account_label=payload.account_label,
+        connection_mode=payload.connection_mode,
+        raw_api_key=payload.api_key,
+        priority_order=payload.priority_order,
+    )
+
+
+@router.post("/claude/switch", response_model=AccountSwitchHandoffResult)
+async def switch_claude_account(payload: SwitchAccountRequest) -> AccountSwitchHandoffResult:
+    """Switches from the current Claude account to the target Claude account and returns the handoff record."""
+    try:
+        return account_service.switch_account(
+            target_account_id=payload.target_account_id,
+            current_task=payload.current_task,
+            next_action=payload.next_action,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+''',
+
+    "backend/tests/test_claude_account_switching.py": '''import pytest
+from unittest.mock import MagicMock
+
+from app.core.vault import CredentialVault
+from app.services.account_service import ClaudeAccountService
+from app.providers.models import CanonicalChatRequest, CanonicalStreamEvent, ChatMessage
+
+
+def test_vault_encrypts_and_masks_api_keys():
+    custom_vault = CredentialVault(master_key="test-master-secret-key-for-unit-tests")
+    raw_key = "sk-ant-api03-secret-account-a-key-9876"
+
+    ciphertext = custom_vault.encrypt(raw_key)
+    assert ciphertext != raw_key.encode("utf-8")
+    assert b"secret-account-a" not in ciphertext
+
+    decrypted = custom_vault.decrypt(ciphertext)
+    assert decrypted == raw_key
+
+    fp = custom_vault.fingerprint(raw_key)
+    assert "sk-a...9876" in fp
+    assert "secret-account-a" not in fp
+
+
+@pytest.mark.asyncio
+async def test_claude_multi_account_switching_isolates_credentials():
+    service = ClaudeAccountService()
+
+    # Configure Account A and Account B with distinct API keys
+    acct_a = service.upsert_account(
+        account_id="acct_claude_a",
+        account_label="Claude Account A",
+        connection_mode="api_key",
+        raw_api_key="sk-ant-key-ACCOUNT-A-1111",
+        priority_order=1,
+    )
+    acct_b = service.upsert_account(
+        account_id="acct_claude_b",
+        account_label="Claude Account B",
+        connection_mode="api_key",
+        raw_api_key="sk-ant-key-ACCOUNT-B-2222",
+        priority_order=2,
+    )
+
+    # Ensure plaintext keys are never present in serialized AccountProfile
+    serialized_a = acct_a.model_dump_json()
+    assert "sk-ant-key-ACCOUNT-A-1111" not in serialized_a
+
+    # Capture which API key is injected into ClaudeProvider on each stream call
+    captured_keys: list[str] = []
+
+    class SpyClaudeProvider:
+        async def stream_chat(self, request, api_key=None):
+            captured_keys.append(api_key)
+            yield CanonicalStreamEvent(type="text_delta", content=f"Reply from {api_key[-4:]}")
+
+    spy_provider = SpyClaudeProvider()
+    req = CanonicalChatRequest(
+        model_id="claude-3-7-sonnet-latest",
+        messages=[ChatMessage(role="user", content="Continue building the REST API")],
+    )
+
+    # 1. Stream with active Account A
+    assert service.get_active_account().id == "acct_claude_a"
+    events_a = [
+        ev async for ev in service.stream_with_active_account(req, claude_provider=spy_provider)
+    ]
+    assert len(events_a) == 1
+    assert captured_keys[-1] == "sk-ant-key-ACCOUNT-A-1111"
+
+    # 2. Switch from Claude Account A -> Claude Account B
+    handoff = service.switch_account(
+        target_account_id="acct_claude_b",
+        current_task="Implementing Phase 10 multi-account vault",
+        next_action="Verify Account B isolated streaming",
+    )
+    assert handoff.previous_account_label == "Claude Account A"
+    assert handoff.active_account_label == "Claude Account B"
+    assert handoff.handoff_markdown_filename == "claude-session-001.md"
+    assert service.get_active_account().id == "acct_claude_b"
+
+    # 3. Stream with active Account B and verify isolated credential injection
+    events_b = [
+        ev async for ev in service.stream_with_active_account(req, claude_provider=spy_provider)
+    ]
+    assert len(events_b) == 1
+    assert captured_keys[-1] == "sk-ant-key-ACCOUNT-B-2222"
+    assert captured_keys == ["sk-ant-key-ACCOUNT-A-1111", "sk-ant-key-ACCOUNT-B-2222"]
+''',
+
+    "backend/PHASE_10_MAIN_PATCH.txt": '''# Add the following lines to backend/app/main.py:
+
+from app.api.v1.accounts import router as accounts_router
+
+# Register alongside your existing routers:
+app.include_router(accounts_router)
+'''
+}
+
+
+def build_zip(destination_path: Path) -> None:
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel_path, content in FILES.items():
+            zf.writestr(rel_path, content)
+    print(f"Successfully created Phase 10 archive at: {destination_path.resolve()}")
+
+
+if __name__ == "__main__":
+    dest = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else DEFAULT_ZIP_DEST
+    build_zip(dest)

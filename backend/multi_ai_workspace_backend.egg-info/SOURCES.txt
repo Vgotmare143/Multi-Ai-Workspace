@@ -1,10 +1,15 @@
 pyproject.toml
+app/config.py
 app/main.py
 app/api/v1/files.py
 app/api/v1/terminal.py
 app/api/v1/workspaces.py
 app/core/__init__.py
 app/core/command_guard.py
+app/core/exceptions.py
+app/core/logger.py
+app/db/models.py
+app/db/session.py
 app/services/file_service.py
 app/services/project_ai_sync.py
 app/services/pty_service.py
@@ -14,5 +19,6 @@ multi_ai_workspace_backend.egg-info/dependency_links.txt
 multi_ai_workspace_backend.egg-info/requires.txt
 multi_ai_workspace_backend.egg-info/top_level.txt
 tests/test_command_guard.py
+tests/test_core_foundation.py
 tests/test_file_service.py
 tests/test_project_ai_sync.py

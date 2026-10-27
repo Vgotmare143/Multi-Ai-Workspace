@@ -1,0 +1,32 @@
+# Append the code below to the END of backend/app/db/models.py
+# (skip any class that already exists from Phase 7).
+# Make sure these imports exist at the TOP of models.py:
+#   from datetime import datetime
+#   from sqlalchemy import String, Boolean, DateTime, ForeignKey, Integer, Text
+#   from sqlalchemy.dialects.postgresql import JSONB
+#   from sqlalchemy.orm import Mapped, mapped_column
+#   from sqlalchemy.sql import func
+# NOTE: do NOT import Base / generate_uuid from app.db.models inside models.py (circular import);
+#       use the ones already defined/imported in that file.
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"))
+    title: Mapped[str] = mapped_column(String, default="New Conversation")
+    structured_state: Mapped[dict] = mapped_column(JSONB, server_default='{}')
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String)  # 'user', 'assistant', 'system', 'tool'
+    content: Mapped[str] = mapped_column(Text)
+    context_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    token_count_input: Mapped[int] = mapped_column(Integer, nullable=True)
+    token_count_output: Mapped[int] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
